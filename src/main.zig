@@ -2,7 +2,7 @@
 const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
-const fs = std.fs;
+const fs = std.Io.Dir;
 const options = @import("build_options");
 
 const output = @import("output.zig");
@@ -57,8 +57,14 @@ fn parseSize(s: []const u8) !u64 {
     return num * multiplier;
 }
 
+fn clockGettime(clock_id: std.c.clockid_t) !std.c.timespec {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(clock_id, &ts) != 0) return error.ClockFailed;
+    return ts;
+}
+
 fn generateTimestamp() ![]const u8 {
-    const ts = try posix.clock_gettime(.REALTIME);
+    const ts = try clockGettime(posix.CLOCK.REALTIME);
     const secs: u64 = @intCast(ts.sec);
     const epoch = std.time.epoch.EpochSeconds{ .secs = secs };
     const day = epoch.getDaySeconds();
@@ -81,6 +87,7 @@ extern "c" fn getpgrp() c_int;
 
 // Signal handler state
 var child_pid: i32 = 0;
+var runtime_io: std.Io = undefined;
 
 fn signalHandler(sig: linux.SIG) callconv(.c) void {
     // Forward signal to child and wait for it to exit
@@ -91,8 +98,8 @@ fn signalHandler(sig: linux.SIG) callconv(.c) void {
         _ = linux.waitpid(child_pid, &status, 0);
     }
     // Cleanup cgroups and temp dirs
-    sandbox.cleanupCgroup();
-    sandbox.cleanupOverlayDirs();
+    sandbox.cleanupCgroup(runtime_io);
+    sandbox.cleanupOverlayDirs(runtime_io);
     // Re-raise signal to get default behavior (exit with signal)
     var default_action: linux.Sigaction = .{
         .handler = .{ .handler = linux.SIG.DFL },
@@ -115,7 +122,7 @@ fn setupSignalHandlers() void {
 }
 
 fn reclaimTerminal() void {
-    if (!posix.isatty(posix.STDIN_FILENO)) return;
+    if (std.c.isatty(posix.STDIN_FILENO) != 1) return;
 
     // Block SIGTTOU/SIGTTIN while we reclaim the terminal
     // (calling tcsetpgrp from background can trigger these)
@@ -151,12 +158,12 @@ const ChangeList = struct {
 };
 
 // Recursively collect changed files in upper dir
-fn collectChanges(upper_path: []const u8, target_dir: []const u8, strip_prefix: []const u8, changes: *ChangeList) void {
-    var dir = fs.openDirAbsolute(upper_path, .{ .iterate = true }) catch return;
-    defer dir.close();
+fn collectChanges(io: std.Io, upper_path: []const u8, target_dir: []const u8, strip_prefix: []const u8, changes: *ChangeList) void {
+    var dir = fs.openDirAbsolute(io, upper_path, .{ .iterate = true }) catch return;
+    defer dir.close(io);
 
     var iter = dir.iterate();
-    while (iter.next() catch null) |entry| {
+    while (iter.next(io) catch null) |entry| {
         const full_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ upper_path, entry.name }) catch continue;
 
         // Build display path (relative to target)
@@ -167,14 +174,14 @@ fn collectChanges(upper_path: []const u8, target_dir: []const u8, strip_prefix: 
 
         if (entry.kind == .directory) {
             // Check if directory is empty (new empty dir) or has contents
-            var subdir = fs.openDirAbsolute(full_path, .{ .iterate = true }) catch continue;
+            var subdir = fs.openDirAbsolute(io, full_path, .{ .iterate = true }) catch continue;
             var sub_iter = subdir.iterate();
-            const has_children = (sub_iter.next() catch null) != null;
-            subdir.close();
+            const has_children = (sub_iter.next(io) catch null) != null;
+            subdir.close(io);
 
             if (has_children) {
                 // Recurse into subdirectories with contents
-                collectChanges(full_path, target_dir, strip_prefix, changes);
+                collectChanges(io, full_path, target_dir, strip_prefix, changes);
             } else {
                 // Empty directory - new dir
                 const path_with_slash = std.fmt.allocPrint(allocator, "{s}/", .{display_path}) catch continue;
@@ -186,7 +193,7 @@ fn collectChanges(upper_path: []const u8, target_dir: []const u8, strip_prefix: 
         } else {
             // Check if file exists in target (edited) or not (added)
             const target_path = std.fmt.allocPrint(allocator, "{s}{s}", .{ target_dir, display_path }) catch continue;
-            const change_type: ChangeType = if (fs.accessAbsolute(target_path, .{}))
+            const change_type: ChangeType = if (fs.accessAbsolute(io, target_path, .{}))
                 .edited
             else |_|
                 .added;
@@ -233,7 +240,7 @@ fn printChanges(changes: []const Change, upper_dir: []const u8) void {
 }
 
 // Handle enter mode - show changes and prompt to apply
-fn handleEnterModeChanges(config: Config) void {
+fn handleEnterModeChanges(io: std.Io, config: Config) void {
     const upper_dir = config.upper_dir orelse return;
     const target_dir = config.enter_target orelse return;
 
@@ -244,16 +251,16 @@ fn handleEnterModeChanges(config: Config) void {
     const changes_path = std.fmt.allocPrint(allocator, "{s}{s}", .{ upper_dir, target_dir }) catch return;
 
     // Check if any changes exist
-    var dir = fs.openDirAbsolute(changes_path, .{ .iterate = true }) catch {
+    var dir = fs.openDirAbsolute(io, changes_path, .{ .iterate = true }) catch {
         success("No changes made to {s}", .{target_dir});
         return;
     };
-    defer dir.close();
+    defer dir.close(io);
 
     // Count changes
     var change_count: usize = 0;
     var iter = dir.iterate();
-    while (iter.next() catch null) |_| {
+    while (iter.next(io) catch null) |_| {
         change_count += 1;
     }
 
@@ -265,7 +272,7 @@ fn handleEnterModeChanges(config: Config) void {
     // Collect all changes (max 1000)
     var change_buf: [1000]Change = undefined;
     var changes = ChangeList{ .items = &change_buf, .len = 0 };
-    collectChanges(changes_path, target_dir, changes_path, &changes);
+    collectChanges(io, changes_path, target_dir, changes_path, &changes);
 
     if (changes.len == 0) {
         success("No changes made to {s}", .{target_dir});
@@ -283,37 +290,44 @@ fn handleEnterModeChanges(config: Config) void {
 
     // Read user input
     var input_buf: [16]u8 = undefined;
-    const n = posix.read(posix.STDIN_FILENO, &input_buf) catch {
+    const bytes_read = std.c.read(posix.STDIN_FILENO, &input_buf, input_buf.len);
+    if (bytes_read < 0) {
         print("\n", .{});
         keepChanges(upper_dir);
         return;
-    };
-    const input = input_buf[0..n];
+    }
+    const input = input_buf[0..@intCast(bytes_read)];
 
     const trimmed = std.mem.trim(u8, input, " \t\r\n");
 
     if (std.mem.eql(u8, trimmed, "y") or std.mem.eql(u8, trimmed, "Y") or std.mem.eql(u8, trimmed, "yes")) {
         // Apply changes using rsync or cp
-        applyChanges(changes_path, target_dir);
+        applyChanges(io, changes_path, target_dir);
     } else if (std.mem.eql(u8, trimmed, "d") or std.mem.eql(u8, trimmed, "D") or std.mem.eql(u8, trimmed, "diff")) {
         // Show full diff (--no-pager to avoid "terminal not fully functional" issues)
         const full_diff_argv = [_][]const u8{ "git", "--no-pager", "diff", "--no-index", target_dir, changes_path };
-        var full_diff_proc = std.process.Child.init(&full_diff_argv, allocator);
-        full_diff_proc.stderr_behavior = .Inherit;
-        full_diff_proc.stdout_behavior = .Inherit;
-        _ = full_diff_proc.spawnAndWait() catch {};
+        var full_diff_proc = std.process.spawn(io, .{
+            .argv = &full_diff_argv,
+            .stderr = .inherit,
+            .stdout = .inherit,
+        }) catch {
+            keepChanges(upper_dir);
+            return;
+        };
+        _ = full_diff_proc.wait(io) catch {};
 
         // Prompt again
         print("\n{s}Apply these changes?{s} [y/N]: ", .{ c1, c2 });
         var input_buf2: [16]u8 = undefined;
-        const n2 = posix.read(posix.STDIN_FILENO, &input_buf2) catch {
+        const bytes_read2 = std.c.read(posix.STDIN_FILENO, &input_buf2, input_buf2.len);
+        if (bytes_read2 < 0) {
             print("\n", .{});
             keepChanges(upper_dir);
             return;
-        };
-        const trimmed2 = std.mem.trim(u8, input_buf2[0..n2], " \t\r\n");
+        }
+        const trimmed2 = std.mem.trim(u8, input_buf2[0..@intCast(bytes_read2)], " \t\r\n");
         if (std.mem.eql(u8, trimmed2, "y") or std.mem.eql(u8, trimmed2, "Y")) {
-            applyChanges(changes_path, target_dir);
+            applyChanges(io, changes_path, target_dir);
         } else {
             keepChanges(upper_dir);
         }
@@ -332,28 +346,63 @@ fn keepChanges(upper_dir: []const u8) void {
     print("{s}Stashed changes in{s} {s}\n", .{ dim, r, upper_dir });
 }
 
-fn applyChanges(source: []const u8, target: []const u8) void {
+fn persistUpperLayer(io: std.Io, source: []const u8, target: []const u8) bool {
+    const argv = [_][]const u8{ "cp", "-a", "-T", source, target };
+    var proc = std.process.spawn(io, .{
+        .argv = &argv,
+        .stderr = .inherit,
+        .stdout = .inherit,
+    }) catch {
+        err("Failed to persist changes to {s}", .{target});
+        return false;
+    };
+    const term = proc.wait(io) catch {
+        err("Failed to persist changes to {s}", .{target});
+        return false;
+    };
+
+    return switch (term) {
+        .exited => |code| if (code == 0) true else failed: {
+            err("Failed to persist changes to {s} (exit code {})", .{ target, code });
+            break :failed false;
+        },
+        else => failed: {
+            err("Failed to persist changes to {s}", .{target});
+            break :failed false;
+        },
+    };
+}
+
+fn applyChanges(io: std.Io, source: []const u8, target: []const u8) void {
     step("Applying changes to {s}", .{target});
 
     // Use rsync to copy changes (handles deletions via whiteouts would need special handling)
     // For now, just copy the files
     const argv = [_][]const u8{ "cp", "-r", "-T", source, target };
-    var proc = std.process.Child.init(&argv, allocator);
-    proc.stderr_behavior = .Inherit;
-    proc.stdout_behavior = .Inherit;
-    const term = proc.spawnAndWait() catch {
+    var proc = std.process.spawn(io, .{
+        .argv = &argv,
+        .stderr = .inherit,
+        .stdout = .inherit,
+    }) catch {
+        err("Failed to apply changes", .{});
+        return;
+    };
+    const term = proc.wait(io) catch {
         err("Failed to apply changes", .{});
         return;
     };
 
-    if (term.Exited == 0) {
-        success("Changes applied successfully", .{});
-    } else {
-        err("Failed to apply changes (exit code {})", .{term.Exited});
+    switch (term) {
+        .exited => |code| if (code == 0)
+            success("Changes applied successfully", .{})
+        else
+            err("Failed to apply changes (exit code {})", .{code}),
+        else => err("Failed to apply changes", .{}),
     }
 }
 
-pub fn run(config: Config) u8 {
+pub fn run(io: std.Io, config: Config) u8 {
+    runtime_io = io;
     const orig_uid = linux.getuid();
     const orig_gid = linux.getgid();
 
@@ -370,7 +419,7 @@ pub fn run(config: Config) u8 {
 
     // Set up cgroups BEFORE fork so child inherits limits
     if (config.memory_limit != null or config.pids_limit != null) {
-        sandbox.setupCgroup(config) catch |cgroup_err| {
+        sandbox.setupCgroup(io, config) catch |cgroup_err| {
             err("cgroup setup failed: {}", .{cgroup_err});
             return 1;
         };
@@ -380,7 +429,7 @@ pub fn run(config: Config) u8 {
     // Set up cleanup paths BEFORE fork (child sets globals but parent does cleanup)
     if (config.mode == .exec) {
         // For exec: create temp dir now so parent knows the path to clean up
-        sandbox.cleanup_temp_base = sandbox.makeTempDir() catch |e| {
+        sandbox.cleanup_temp_base = sandbox.makeTempDir(io) catch |e| {
             err("makeTempDir: {}", .{e});
             return 1;
         };
@@ -388,10 +437,8 @@ pub fn run(config: Config) u8 {
         // For run/enter: set up paths for .work and .merged cleanup
         sandbox.cleanup_work_dir = std.fmt.allocPrint(allocator, "{s}.work", .{config.upper_dir.?}) catch null;
         sandbox.cleanup_merged_dir = std.fmt.allocPrint(allocator, "{s}.merged", .{config.upper_dir.?}) catch null;
-        // For enter mode (and interactive run), also clean up the temp upper dir
-        if (config.enter_target != null) {
-            sandbox.cleanup_temp_base = config.upper_dir;
-        }
+        // Active storage is always temporary; run mode exports it before cleanup.
+        sandbox.cleanup_temp_base = config.upper_dir;
     }
 
     // Set up signal handlers BEFORE fork for cleanup on SIGTERM/SIGINT
@@ -402,7 +449,7 @@ pub fn run(config: Config) u8 {
 
     if (pid == 0) {
         // Child
-        sandbox.childMain(config, orig_uid, orig_gid);
+        sandbox.childMain(io, config, orig_uid, orig_gid);
     } else if (pid > 0) {
         // Parent - wait for child with optional timeout
         child_pid = @intCast(pid);
@@ -410,11 +457,11 @@ pub fn run(config: Config) u8 {
 
         if (config.timeout) |timeout_secs| {
             // Get monotonic time for timeout tracking
-            const start_ts = posix.clock_gettime(.MONOTONIC) catch {
+            const start_ts = clockGettime(posix.CLOCK.MONOTONIC) catch {
                 // Fall back to no timeout if clock fails
-                const status = posix.waitpid(child_pid, 0).status;
-                sandbox.cleanupCgroup();
-                sandbox.cleanupOverlayDirs();
+                const status = sandbox.waitPid(child_pid, 0).status;
+                sandbox.cleanupCgroup(io);
+                sandbox.cleanupOverlayDirs(io);
                 if ((status & 0x7f) == 0) return @truncate((status >> 8) & 0xff);
                 if (((status & 0x7f) + 1) >> 1 > 0) return 128 + @as(u8, @truncate(status & 0x7f));
                 return 1;
@@ -423,11 +470,11 @@ pub fn run(config: Config) u8 {
 
             while (true) {
                 // Non-blocking wait
-                const result = posix.waitpid(child_pid, posix.W.NOHANG);
+                const result = sandbox.waitPid(child_pid, linux.W.NOHANG);
                 if (result.pid != 0) {
                     // Child exited
-                    sandbox.cleanupCgroup();
-                    sandbox.cleanupOverlayDirs();
+                    sandbox.cleanupCgroup(io);
+                    sandbox.cleanupOverlayDirs(io);
                     const status = result.status;
                     if ((status & 0x7f) == 0) {
                         return @truncate((status >> 8) & 0xff);
@@ -439,30 +486,33 @@ pub fn run(config: Config) u8 {
                 }
 
                 // Check timeout
-                const now_ts = posix.clock_gettime(.MONOTONIC) catch continue;
+                const now_ts = clockGettime(posix.CLOCK.MONOTONIC) catch continue;
                 if (now_ts.sec >= deadline_sec) {
                     warn("timeout after {d}s, killing process", .{timeout_secs});
                     _ = linux.kill(child_pid, linux.SIG.KILL);
-                    _ = posix.waitpid(child_pid, 0);
-                    sandbox.cleanupCgroup();
-                    sandbox.cleanupOverlayDirs();
+                    _ = sandbox.waitPid(child_pid, 0);
+                    sandbox.cleanupCgroup(io);
+                    sandbox.cleanupOverlayDirs(io);
                     return 124; // Standard timeout exit code
                 }
 
                 // Sleep briefly before checking again (10ms)
-                posix.nanosleep(0, 10_000_000);
+                var sleep_time: linux.timespec = .{ .sec = 0, .nsec = 10_000_000 };
+                _ = linux.nanosleep(&sleep_time, null);
             }
         } else {
             // No timeout - blocking wait
-            const status = posix.waitpid(child_pid, 0).status;
-            sandbox.cleanupCgroup();
+            const status = sandbox.waitPid(child_pid, 0).status;
+            sandbox.cleanupCgroup(io);
 
-            // Handle interactive mode - prompt to apply changes before cleanup
+            // Handle interactive mode - prompt to apply changes before cleanup.
             if (config.enter_target != null) {
-                handleEnterModeChanges(config);
+                handleEnterModeChanges(io, config);
+            } else if (config.persist_dir) |persist_dir| {
+                _ = persistUpperLayer(io, config.upper_dir.?, persist_dir);
             }
 
-            sandbox.cleanupOverlayDirs();
+            sandbox.cleanupOverlayDirs(io);
 
             if ((status & 0x7f) == 0) {
                 return @truncate((status >> 8) & 0xff);
@@ -474,8 +524,8 @@ pub fn run(config: Config) u8 {
         }
     } else {
         err("fork failed: {}", .{sandbox.errnoFromSyscall(pid)});
-        sandbox.cleanupCgroup();
-        sandbox.cleanupOverlayDirs();
+        sandbox.cleanupCgroup(io);
+        sandbox.cleanupOverlayDirs(io);
         return 1;
     }
 }
@@ -523,7 +573,7 @@ fn printModeHelp(mode: sandbox.Mode) void {
             print("  {s}${s} poof run bun install              {s}# Review changes first{s}\n", .{ D, R, D, R });
             print("  {s}${s} poof run --upper=./changes bash   {s}# Persist to ./changes/{s}\n", .{ D, R, D, R });
             print("\n{s}When the command exits, you'll see:{s}\n", .{ D, R });
-            print("  {s}poof{s}: {s}3 changed files{s} /tmp/poof-xxx\n", .{ BB, R, B, R });
+            print("  {s}poof{s}: {s}3 changed files{s} /dev/shm/poof-xxx\n", .{ BB, R, B, R });
             print("    {s}+{s} src/new-file.txt\n", .{ G, R });
             print("    {s}~{s} src/modified.txt\n", .{ Y, R });
             print("    {s}-{s} src/deleted.txt\n", .{ RE, R });
@@ -622,10 +672,10 @@ fn printUsage() void {
     , .{ B, R, D, R, D, R, D, R, D, R, D, R, Y, R, D, R, G, R });
 }
 
-pub fn main() u8 {
-    output.init();
+pub fn main(init: std.process.Init) u8 {
+    output.init(init.minimal.environ.getPosix("NO_COLOR") != null);
 
-    const args = std.process.argsAlloc(allocator) catch {
+    const args = init.minimal.args.toSlice(init.arena.allocator()) catch {
         err("out of memory", .{});
         return 1;
     };
@@ -636,7 +686,9 @@ pub fn main() u8 {
     }
 
     var cwd_buf: [4096]u8 = undefined;
-    const cwd = posix.getcwd(&cwd_buf) catch "/";
+    const cwd_len = std.process.currentPath(init.io, &cwd_buf) catch 1;
+    if (cwd_len == 1) cwd_buf[0] = '/';
+    const cwd = cwd_buf[0..cwd_len];
 
     var config = Config{
         .mode = .exec,
@@ -724,7 +776,7 @@ pub fn main() u8 {
 
     // Handle enter mode specially - uses $SHELL, no command needed
     if (config.mode == .enter) {
-        const shell = std.posix.getenv("SHELL") orelse "/bin/sh";
+        const shell = init.minimal.environ.getPosix("SHELL") orelse "/bin/sh";
         const shell_args = allocator.alloc([]const u8, 1) catch {
             err("out of memory", .{});
             return 1;
@@ -734,7 +786,7 @@ pub fn main() u8 {
         config.enter_target = cwd;
 
         // Create temp upper dir for enter mode
-        config.upper_dir = sandbox.makeTempDir() catch {
+        config.upper_dir = sandbox.makeTempDir(init.io) catch {
             err("failed to create temp dir", .{});
             return 1;
         };
@@ -748,52 +800,54 @@ pub fn main() u8 {
 
     // Determine upper directory for run mode
     if (config.mode == .run) {
-        const is_interactive = std.posix.isatty(std.posix.STDIN_FILENO);
+        const is_interactive = std.c.isatty(std.posix.STDIN_FILENO) == 1;
 
         if (upper_dir) |dir| {
-            // --upper explicitly provided: persist changes there
+            // --upper names the export destination. The active FUSE upper must
+            // live on a separate filesystem from lowerdir=/ to avoid recursion.
             if (dir.len > 0 and dir[0] != '/') {
-                config.upper_dir = std.fmt.allocPrint(allocator, "{s}/{s}", .{ cwd, dir }) catch {
+                config.persist_dir = std.fmt.allocPrint(allocator, "{s}/{s}", .{ cwd, dir }) catch {
                     err("out of memory", .{});
                     return 1;
                 };
             } else {
-                config.upper_dir = dir;
+                config.persist_dir = dir;
             }
         } else if (is_interactive) {
-            // Interactive mode without --upper: use temp dir and prompt y/n/d on exit
-            config.upper_dir = sandbox.makeTempDir() catch {
-                err("failed to create temp dir", .{});
-                return 1;
-            };
-            config.enter_target = cwd; // Triggers y/n/d prompt on exit
+            // Interactive mode without --upper: prompt y/n/d on exit.
+            config.enter_target = cwd;
         } else {
-            // Non-interactive without --upper: auto-generate from command name
+            // Non-interactive without --upper: auto-generate an export destination.
             const cmd_name = std.fs.path.basename(config.command[0]);
             const base_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ cwd, cmd_name }) catch {
                 err("out of memory", .{});
                 return 1;
             };
 
-            // Check if base path exists, if so append timestamp
-            if (std.fs.accessAbsolute(base_path, .{})) |_| {
+            // Check if base path exists, if so append timestamp.
+            if (fs.accessAbsolute(init.io, base_path, .{})) |_| {
                 const ts = generateTimestamp() catch {
                     err("clock error", .{});
                     return 1;
                 };
-                config.upper_dir = std.fmt.allocPrint(allocator, "{s}.{s}", .{ base_path, ts }) catch {
+                config.persist_dir = std.fmt.allocPrint(allocator, "{s}.{s}", .{ base_path, ts }) catch {
                     err("out of memory", .{});
                     return 1;
                 };
             } else |_| {
-                config.upper_dir = base_path;
+                config.persist_dir = base_path;
             }
 
             const hc = col(Color.bold ++ Color.cyan);
             const rc = col(Color.reset);
-            info("Changes will persist to {s}{s}{s}", .{ hc, config.upper_dir.?, rc });
+            info("Changes will persist to {s}{s}{s}", .{ hc, config.persist_dir.?, rc });
         }
+
+        config.upper_dir = sandbox.makeTempDir(init.io) catch {
+            err("failed to create temporary overlay storage in /dev/shm", .{});
+            return 1;
+        };
     }
 
-    return run(config);
+    return run(init.io, config);
 }

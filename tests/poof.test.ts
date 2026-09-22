@@ -7,8 +7,8 @@ import { StringDecoder } from "node:string_decoder";
 const POOF_BIN = join(import.meta.dir, "../zig-out/bin/poof");
 // Use ephemeral tmpdir - must be outside /tmp since poof mounts fresh /tmp
 let TEST_DIR: string;
-// Shell prompt: # for root, $ for non-root
-const SHELL_PROMPT = process.getuid?.() === 0 ? "# " : "$ ";
+// The sandbox enters a user namespace as mapped root, regardless of host UID.
+const SHELL_PROMPT = "# ";
 
 describe("poof CLI", () => {
   beforeAll(() => {

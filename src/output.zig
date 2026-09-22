@@ -32,12 +32,12 @@ pub const Icon = struct {
 var use_color: bool = true;
 var verbose_mode: bool = false;
 
-pub fn init() void {
-    if (std.posix.getenv("NO_COLOR")) |_| {
+pub fn init(no_color: bool) void {
+    if (no_color) {
         use_color = false;
         return;
     }
-    use_color = std.posix.isatty(std.posix.STDERR_FILENO);
+    use_color = std.c.isatty(std.posix.STDERR_FILENO) == 1;
 }
 
 pub fn setVerbose(v: bool) void {
@@ -51,8 +51,9 @@ pub fn isVerbose() bool {
 fn writeStderr(data: []const u8) void {
     var remaining = data;
     while (remaining.len > 0) {
-        const written = posix.write(posix.STDERR_FILENO, remaining) catch return;
-        remaining = remaining[written..];
+        const written = std.c.write(posix.STDERR_FILENO, remaining.ptr, remaining.len);
+        if (written <= 0) return;
+        remaining = remaining[@intCast(written)..];
     }
 }
 

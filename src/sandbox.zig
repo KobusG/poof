@@ -1,11 +1,12 @@
 const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
-const fs = std.fs;
+const fs = std.Io.Dir;
 const output = @import("output.zig");
 
-// C library function for setting environment variables
+// C library functions used after forking, where std.Io process APIs are unavailable.
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn execvpe(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) c_int;
 
 // Re-export output functions for convenience
 pub const step = output.step;
@@ -31,10 +32,25 @@ pub fn Maybe(comptime T: type) type {
     };
 }
 
+fn setParentDeathSignal() void {
+    _ = linux.prctl(@intFromEnum(linux.PR.SET_PDEATHSIG), @as(usize, @intFromEnum(linux.SIG.KILL)), 0, 0, 0);
+}
+
 pub fn errnoFromSyscall(r: usize) Errno {
     const signed_r: isize = @bitCast(r);
     const int: u16 = if (signed_r > -4096 and signed_r < 0) @intCast(-signed_r) else 0;
     return @enumFromInt(int);
+}
+
+pub const WaitResult = struct {
+    pid: i32,
+    status: u32,
+};
+
+pub fn waitPid(pid: i32, flags: u32) WaitResult {
+    var status: c_int = 0;
+    const waited = std.c.waitpid(pid, &status, @intCast(flags));
+    return .{ .pid = waited, .status = @bitCast(status) };
 }
 
 pub const Mode = enum {
@@ -46,7 +62,11 @@ pub const Mode = enum {
 pub const Config = struct {
     mode: Mode,
     command: []const []const u8,
+    // Active overlay storage. Persistent/review modes keep this on a separate
+    // tmpfs so fuse-overlayfs cannot recurse through lowerdir=/.
     upper_dir: ?[]const u8 = null,
+    // Optional destination where run mode exports the active upper layer.
+    persist_dir: ?[]const u8 = null,
     verbose: bool = false,
     cwd: []const u8 = "/",
     // Resource limits (cgroups v2)
@@ -90,24 +110,24 @@ pub fn pivotRoot(new_root: [*:0]const u8, put_old: [*:0]const u8) Maybe(void) {
     return .{ .ok = {} };
 }
 
-pub fn writeFile(path: []const u8, content: []const u8) !void {
-    const file = try fs.openFileAbsolute(path, .{ .mode = .write_only });
-    defer file.close();
-    try file.writeAll(content);
+pub fn writeFile(io: std.Io, path: []const u8, content: []const u8) !void {
+    const file = try fs.openFileAbsolute(io, path, .{ .mode = .write_only });
+    defer file.close(io);
+    try file.writeStreamingAll(io, content);
 }
 
 // ============================================================================
 // User Namespace Setup
 // ============================================================================
 
-pub fn setupUidGidMappings(uid: u32, gid: u32) !void {
+pub fn setupUidGidMappings(io: std.Io, uid: u32, gid: u32) !void {
     var buf: [64]u8 = undefined;
 
     const uid_content = try std.fmt.bufPrint(&buf, "0 {d} 1\n", .{uid});
-    try writeFile("/proc/self/uid_map", uid_content);
-    try writeFile("/proc/self/setgroups", "deny");
+    try writeFile(io, "/proc/self/uid_map", uid_content);
+    try writeFile(io, "/proc/self/setgroups", "deny");
     const gid_content = try std.fmt.bufPrint(&buf, "0 {d} 1\n", .{gid});
-    try writeFile("/proc/self/gid_map", gid_content);
+    try writeFile(io, "/proc/self/gid_map", gid_content);
 }
 
 // ============================================================================
@@ -119,17 +139,17 @@ pub var cleanup_temp_base: ?[]const u8 = null; // exec/enter mode: temp dir to d
 pub var cleanup_work_dir: ?[]const u8 = null; // run mode: .work dir to delete
 pub var cleanup_merged_dir: ?[]const u8 = null; // run mode: .merged dir to delete
 
-pub fn cleanupOverlayDirs() void {
+pub fn cleanupOverlayDirs(io: std.Io) void {
     // Delete temp base directory (exec and enter modes)
     if (cleanup_temp_base) |path| {
-        fs.deleteTreeAbsolute(path) catch {};
+        fs.cwd().deleteTree(io, path) catch {};
     }
     // Run mode: delete the .work and .merged directories we created
     if (cleanup_work_dir) |path| {
-        fs.deleteTreeAbsolute(path) catch {};
+        fs.cwd().deleteTree(io, path) catch {};
     }
     if (cleanup_merged_dir) |path| {
-        fs.deleteTreeAbsolute(path) catch {};
+        fs.cwd().deleteTree(io, path) catch {};
     }
 }
 
@@ -140,11 +160,12 @@ pub fn cleanupOverlayDirs() void {
 var cgroup_path: ?[]const u8 = null;
 var original_cgroup: ?[]const u8 = null;
 
-fn getOriginalCgroup() ?[]const u8 {
-    const file = fs.openFileAbsolute("/proc/self/cgroup", .{}) catch return null;
-    defer file.close();
+fn getOriginalCgroup(io: std.Io) ?[]const u8 {
+    const file = fs.openFileAbsolute(io, "/proc/self/cgroup", .{}) catch return null;
+    defer file.close(io);
     var buf: [256]u8 = undefined;
-    const n = file.read(&buf) catch return null;
+    var reader = file.readerStreaming(io, &.{});
+    const n = reader.interface.readSliceShort(&buf) catch return null;
     const data = buf[0..n];
     // Format: "0::/path/to/cgroup\n"
     if (std.mem.indexOf(u8, data, "::")) |idx| {
@@ -156,9 +177,9 @@ fn getOriginalCgroup() ?[]const u8 {
     return null;
 }
 
-pub fn setupCgroup(config: Config) !void {
+pub fn setupCgroup(io: std.Io, config: Config) !void {
     // Check if cgroups v2 is available
-    fs.accessAbsolute("/sys/fs/cgroup/cgroup.controllers", .{}) catch {
+    fs.accessAbsolute(io, "/sys/fs/cgroup/cgroup.controllers", .{}) catch {
         if (config.memory_limit != null or config.pids_limit != null) {
             return error.CgroupsNotAvailable;
         }
@@ -166,16 +187,16 @@ pub fn setupCgroup(config: Config) !void {
     };
 
     // Save original cgroup for cleanup
-    original_cgroup = getOriginalCgroup();
+    original_cgroup = getOriginalCgroup(io);
 
     // Create unique cgroup
     var rand_buf: [8]u8 = undefined;
-    std.crypto.random.bytes(&rand_buf);
+    try std.Io.randomSecure(io, &rand_buf);
     var suffix: [16]u8 = undefined;
     _ = std.fmt.bufPrint(&suffix, "{x:0>16}", .{std.mem.readInt(u64, &rand_buf, .little)}) catch unreachable;
     cgroup_path = try std.fmt.allocPrint(allocator, "/sys/fs/cgroup/poof-{s}", .{suffix});
 
-    fs.makeDirAbsolute(cgroup_path.?) catch |e| {
+    fs.createDirAbsolute(io, cgroup_path.?, .default_dir) catch |e| {
         log("failed to create cgroup: {}", .{e});
         return e;
     };
@@ -186,7 +207,7 @@ pub fn setupCgroup(config: Config) !void {
     if (config.memory_limit) |mem| {
         const path = try std.fmt.allocPrint(allocator, "{s}/memory.max", .{cgroup_path.?});
         const content = try std.fmt.bufPrint(&buf, "{d}", .{mem});
-        writeFile(path, content) catch |e| {
+        writeFile(io, path, content) catch |e| {
             log("failed to set memory limit: {}", .{e});
         };
         log("cgroup memory.max={d}", .{mem});
@@ -196,7 +217,7 @@ pub fn setupCgroup(config: Config) !void {
     if (config.pids_limit) |pids| {
         const path = try std.fmt.allocPrint(allocator, "{s}/pids.max", .{cgroup_path.?});
         const content = try std.fmt.bufPrint(&buf, "{d}", .{pids});
-        writeFile(path, content) catch |e| {
+        writeFile(io, path, content) catch |e| {
             log("failed to set pids limit: {}", .{e});
         };
         log("cgroup pids.max={d}", .{pids});
@@ -205,22 +226,22 @@ pub fn setupCgroup(config: Config) !void {
     // Move current process into cgroup
     const procs_path = try std.fmt.allocPrint(allocator, "{s}/cgroup.procs", .{cgroup_path.?});
     const pid_content = try std.fmt.bufPrint(&buf, "{d}", .{linux.getpid()});
-    try writeFile(procs_path, pid_content);
+    try writeFile(io, procs_path, pid_content);
 
     log("cgroup created: {s}", .{cgroup_path.?});
 }
 
-pub fn cleanupCgroup() void {
+pub fn cleanupCgroup(io: std.Io) void {
     if (cgroup_path) |path| {
         // Move ourselves back to original cgroup first
         if (original_cgroup) |orig| {
             var buf: [32]u8 = undefined;
             const pid_str = std.fmt.bufPrint(&buf, "{d}", .{linux.getpid()}) catch return;
-            writeFile(orig, pid_str) catch {};
+            writeFile(io, orig, pid_str) catch {};
         }
 
         // Now remove the empty cgroup
-        fs.deleteDirAbsolute(path) catch {};
+        fs.deleteDirAbsolute(io, path) catch {};
     }
 }
 
@@ -228,20 +249,24 @@ pub fn cleanupCgroup() void {
 // Helper Functions
 // ============================================================================
 
-pub fn makeTempDir() ![]const u8 {
+pub fn makeTempDir(io: std.Io) ![]const u8 {
     var rand_buf: [8]u8 = undefined;
-    std.crypto.random.bytes(&rand_buf);
+    try std.Io.randomSecure(io, &rand_buf);
     var suffix: [16]u8 = undefined;
     _ = std.fmt.bufPrint(&suffix, "{x:0>16}", .{std.mem.readInt(u64, &rand_buf, .little)}) catch unreachable;
-    const path = try std.fmt.allocPrint(allocator, "/tmp/poof-{s}", .{suffix});
-    try fs.makeDirAbsolute(path);
+    // lowerdir=/ contains every directory on the root filesystem. Keeping the
+    // FUSE upper/work/merged directories on that same filesystem lets the
+    // daemon traverse its own mount and deadlock. /dev/shm is a separate tmpfs
+    // and remains visible to the parent for review/export after the child exits.
+    const path = try std.fmt.allocPrint(allocator, "/dev/shm/poof-{s}", .{suffix});
+    try fs.createDirAbsolute(io, path, .default_dir);
     return path;
 }
 
 // FUSE overlay state (for non-root mode)
 var fuse_overlay_pid: ?i32 = null;
 
-fn mountFuseOverlay(lower: []const u8, upper: []const u8, work: []const u8, merged: []const u8) !void {
+fn mountFuseOverlay(io: std.Io, lower: []const u8, upper: []const u8, work: []const u8, merged: []const u8) !void {
     const opts = try std.fmt.allocPrint(allocator, "lowerdir={s},upperdir={s},workdir={s},squash_to_root", .{ lower, upper, work });
     const opts_z = try allocator.dupeZ(u8, opts);
     const merged_z = try allocator.dupeZ(u8, merged);
@@ -250,7 +275,9 @@ fn mountFuseOverlay(lower: []const u8, upper: []const u8, work: []const u8, merg
     // This keeps the FUSE daemon running as a child process
     const pid = linux.fork();
     if (pid == 0) {
-        // Child - exec fuse-overlayfs in foreground
+        // Child - exec fuse-overlayfs in foreground. PDEATHSIG is cleared by
+        // fork, so restore it to prevent daemon leaks when sandbox PID 1 dies.
+        setParentDeathSignal();
         const argv = [_:null]?[*:0]const u8{
             "fuse-overlayfs",
             "-f", // foreground mode - required for chroot to work
@@ -260,13 +287,14 @@ fn mountFuseOverlay(lower: []const u8, upper: []const u8, work: []const u8, merg
             null,
         };
         _ = linux.execve("/usr/bin/fuse-overlayfs", &argv, @ptrCast(std.c.environ));
-        posix.exit(127); // exec failed
+        std.process.exit(127); // exec failed
     } else if (pid > 0) {
         // Parent - save PID for cleanup, wait briefly for mount
         fuse_overlay_pid = @intCast(pid);
 
         // Give fuse-overlayfs time to set up the mount
-        posix.nanosleep(0, 100_000_000); // 100ms
+        var sleep_time: linux.timespec = .{ .sec = 0, .nsec = 100_000_000 };
+        _ = linux.nanosleep(&sleep_time, null); // 100ms
 
         // Check if child exited (indicates failure - it should stay running)
         var status: u32 = 0;
@@ -281,13 +309,13 @@ fn mountFuseOverlay(lower: []const u8, upper: []const u8, work: []const u8, merg
         }
 
         // Verify mount succeeded by checking if merged dir has content
-        var dir = fs.openDirAbsolute(merged, .{ .iterate = true }) catch {
+        var dir = fs.openDirAbsolute(io, merged, .{ .iterate = true }) catch {
             return error.MountVerifyFailed;
         };
-        defer dir.close();
+        defer dir.close(io);
 
         var it = dir.iterate();
-        if ((it.next() catch null) == null) {
+        if ((it.next(io) catch null) == null) {
             // Directory is empty - mount didn't work
             return error.MountVerifyFailed;
         }
@@ -297,7 +325,7 @@ fn mountFuseOverlay(lower: []const u8, upper: []const u8, work: []const u8, merg
 }
 
 // Set up minimal /dev with only safe devices (no disk access!)
-fn setupMinimalDev(merged_dir: []const u8) !void {
+fn setupMinimalDev(io: std.Io, merged_dir: []const u8) !void {
     const dev_path = try std.fmt.allocPrint(allocator, "{s}/dev", .{merged_dir});
 
     // Mount tmpfs on /dev
@@ -309,10 +337,10 @@ fn setupMinimalDev(merged_dir: []const u8) !void {
 
     // Create necessary subdirectories
     const pts_path = try std.fmt.allocPrint(allocator, "{s}/pts", .{dev_path});
-    fs.makeDirAbsolute(pts_path) catch {};
+    fs.createDirAbsolute(io, pts_path, .default_dir) catch {};
 
     const shm_path = try std.fmt.allocPrint(allocator, "{s}/shm", .{dev_path});
-    fs.makeDirAbsolute(shm_path) catch {};
+    fs.createDirAbsolute(io, shm_path, .default_dir) catch {};
 
     // Bind-mount only safe devices from host
     const safe_devices = [_][]const u8{ "null", "zero", "full", "random", "urandom", "tty" };
@@ -323,8 +351,8 @@ fn setupMinimalDev(merged_dir: []const u8) !void {
         const dst_z = try allocator.dupeZ(u8, dst);
 
         // Create empty file as mount target
-        const file = fs.createFileAbsolute(dst, .{}) catch continue;
-        file.close();
+        const file = fs.createFileAbsolute(io, dst, .{}) catch continue;
+        file.close(io);
 
         // Bind mount the device
         _ = mount(src_z.ptr, dst_z.ptr, "none", linux.MS.BIND, null);
@@ -336,16 +364,18 @@ fn setupMinimalDev(merged_dir: []const u8) !void {
 
     // Create ptmx symlink (use cwd-relative symlink creation)
     const ptmx_path = try std.fmt.allocPrint(allocator, "{s}/ptmx", .{dev_path});
-    posix.symlinkat("pts/ptmx", posix.AT.FDCWD, ptmx_path) catch {};
+    const ptmx_path_z = try allocator.dupeZ(u8, ptmx_path);
+    _ = std.c.symlinkat("pts/ptmx", posix.AT.FDCWD, ptmx_path_z.ptr);
 
     log("minimal /dev created (no disk devices)", .{});
 }
 
-fn isInOverlayEnvironment() bool {
-    const file = fs.openFileAbsolute("/proc/mounts", .{}) catch return false;
-    defer file.close();
+fn isInOverlayEnvironment(io: std.Io) bool {
+    const file = fs.openFileAbsolute(io, "/proc/mounts", .{}) catch return false;
+    defer file.close(io);
     var buf: [8192]u8 = undefined;
-    const n = file.read(&buf) catch return false;
+    var reader = file.readerStreaming(io, &.{});
+    const n = reader.interface.readSliceShort(&buf) catch return false;
     const data = buf[0..n];
 
     var lines = std.mem.splitScalar(u8, data, '\n');
@@ -365,8 +395,8 @@ fn isInOverlayEnvironment() bool {
 // Overlay Setup
 // ============================================================================
 
-pub fn setupOverlay(config: Config, use_kernel_overlay: bool) Maybe(void) {
-    const in_overlay = isInOverlayEnvironment();
+pub fn setupOverlay(io: std.Io, config: Config, use_kernel_overlay: bool) Maybe(void) {
+    const in_overlay = isInOverlayEnvironment(io);
     if (in_overlay) {
         log("detected overlay environment (Docker/container)", .{});
     }
@@ -414,7 +444,7 @@ pub fn setupOverlay(config: Config, use_kernel_overlay: bool) Maybe(void) {
 
     // Create directories
     inline for (.{ upper_dir, work_dir, merged_dir }) |dir| {
-        fs.makeDirAbsolute(dir) catch |e| {
+        fs.createDirAbsolute(io, dir, .default_dir) catch |e| {
             if (e != error.PathAlreadyExists) {
                 err("mkdir {s}: {}", .{ dir, e });
                 return .{ .err = .ACCES };
@@ -455,7 +485,7 @@ pub fn setupOverlay(config: Config, use_kernel_overlay: bool) Maybe(void) {
         log("overlay mounted (kernel)", .{});
     } else {
         // Use fuse-overlayfs for non-root (with squash_to_root)
-        mountFuseOverlay("/", upper_dir, work_dir, merged_dir) catch |e| {
+        mountFuseOverlay(io, "/", upper_dir, work_dir, merged_dir) catch |e| {
             switch (e) {
                 error.FuseOverlayfsNotFound => {
                     err("fuse-overlayfs not found", .{});
@@ -479,17 +509,19 @@ pub fn setupOverlay(config: Config, use_kernel_overlay: bool) Maybe(void) {
     }
     vstep("Overlay filesystem ready", .{});
 
+    const cwd_z = allocator.dupeZ(u8, config.cwd) catch return .{ .err = .NOMEM };
+
     if (use_kernel_overlay) {
         // Kernel overlay mode: use pivot_root for strong isolation
         // Set up minimal /dev BEFORE pivot_root (device nodes don't work through overlay)
-        setupMinimalDev(merged_dir) catch |e| {
+        setupMinimalDev(io, merged_dir) catch |e| {
             log("failed to set up minimal /dev: {}", .{e});
             // Continue anyway - some things may still work
         };
 
         const oldroot_str = std.fmt.allocPrint(allocator, "{s}/.oldroot", .{merged_dir}) catch return .{ .err = .NOMEM };
         const oldroot = allocator.dupeZ(u8, oldroot_str) catch return .{ .err = .NOMEM };
-        fs.makeDirAbsolute(oldroot) catch |e| {
+        fs.createDirAbsolute(io, oldroot, .default_dir) catch |e| {
             if (e != error.PathAlreadyExists) return .{ .err = .ACCES };
         };
 
@@ -498,16 +530,16 @@ pub fn setupOverlay(config: Config, use_kernel_overlay: bool) Maybe(void) {
             .ok => {},
         }
 
-        posix.chdir(config.cwd) catch {
-            posix.chdir("/") catch {};
-        };
+        if (std.c.chdir(cwd_z.ptr) != 0) {
+            _ = std.c.chdir("/");
+        }
 
         // Detach old root
         switch (umount2("/.oldroot", linux.MNT.DETACH)) {
             .err => |e| return .{ .err = e },
             .ok => {},
         }
-        fs.deleteDirAbsolute("/.oldroot") catch {};
+        fs.deleteDirAbsolute(io, "/.oldroot") catch {};
 
         // Mount fresh /proc for the new PID namespace
         _ = umount2("/proc", linux.MNT.DETACH);
@@ -529,7 +561,7 @@ pub fn setupOverlay(config: Config, use_kernel_overlay: bool) Maybe(void) {
     } else {
         // Non-root mode with fuse-overlayfs: use chroot (pivot_root doesn't work with FUSE)
         // Set up minimal /dev (don't bind-mount host /dev - that exposes disk devices!)
-        setupMinimalDev(merged_dir) catch |e| {
+        setupMinimalDev(io, merged_dir) catch |e| {
             log("failed to set up minimal /dev: {}", .{e});
             // Continue anyway - some things may still work
         };
@@ -541,9 +573,9 @@ pub fn setupOverlay(config: Config, use_kernel_overlay: bool) Maybe(void) {
             err("chroot failed: {}", .{chroot_err});
             return .{ .err = chroot_err };
         }
-        posix.chdir(config.cwd) catch {
-            posix.chdir("/") catch {};
-        };
+        if (std.c.chdir(cwd_z.ptr) != 0) {
+            _ = std.c.chdir("/");
+        }
         log("chroot active", .{});
 
         // Mount fresh /proc for PID namespace (not bind-mount - that would leak host processes)
@@ -563,10 +595,10 @@ pub fn setupOverlay(config: Config, use_kernel_overlay: bool) Maybe(void) {
         }
 
         // Create symlinks for standard file descriptors (now that /proc is mounted)
-        posix.symlinkat("/proc/self/fd", posix.AT.FDCWD, "/dev/fd") catch {};
-        posix.symlinkat("/proc/self/fd/0", posix.AT.FDCWD, "/dev/stdin") catch {};
-        posix.symlinkat("/proc/self/fd/1", posix.AT.FDCWD, "/dev/stdout") catch {};
-        posix.symlinkat("/proc/self/fd/2", posix.AT.FDCWD, "/dev/stderr") catch {};
+        _ = std.c.symlinkat("/proc/self/fd", posix.AT.FDCWD, "/dev/fd");
+        _ = std.c.symlinkat("/proc/self/fd/0", posix.AT.FDCWD, "/dev/stdin");
+        _ = std.c.symlinkat("/proc/self/fd/1", posix.AT.FDCWD, "/dev/stdout");
+        _ = std.c.symlinkat("/proc/self/fd/2", posix.AT.FDCWD, "/dev/stderr");
     }
 
     if (output.isVerbose()) {
@@ -579,9 +611,9 @@ pub fn setupOverlay(config: Config, use_kernel_overlay: bool) Maybe(void) {
 // Child Process Entry Point
 // ============================================================================
 
-pub fn childMain(config: Config, orig_uid: u32, orig_gid: u32) noreturn {
-    // Set up death signal - if parent dies, we get SIGKILL
-    _ = linux.prctl(@intFromEnum(linux.PR.SET_PDEATHSIG), @as(usize, @intFromEnum(linux.SIG.KILL)), 0, 0, 0);
+pub fn childMain(io: std.Io, config: Config, orig_uid: u32, orig_gid: u32) noreturn {
+    // Set up death signal - if parent dies, we get SIGKILL.
+    setParentDeathSignal();
 
     const is_root = orig_uid == 0;
 
@@ -610,14 +642,14 @@ pub fn childMain(config: Config, orig_uid: u32, orig_gid: u32) noreturn {
         if (e == .PERM) {
             err("namespace creation denied - in Docker, use: --security-opt seccomp=unconfined", .{});
         }
-        posix.exit(1);
+        std.process.exit(1);
     }
 
     // Set up uid/gid mappings for user namespace
     if (using_user_ns) {
-        setupUidGidMappings(orig_uid, orig_gid) catch |ue| {
+        setupUidGidMappings(io, orig_uid, orig_gid) catch |ue| {
             err("uid/gid mapping failed: {}", .{ue});
-            posix.exit(1);
+            std.process.exit(1);
         };
     }
 
@@ -627,16 +659,20 @@ pub fn childMain(config: Config, orig_uid: u32, orig_gid: u32) noreturn {
         // Parent waits for child and exits with its status
         if (pid > 0) {
             const child: i32 = @intCast(pid);
-            const status = posix.waitpid(child, 0).status;
+            const status = waitPid(child, 0).status;
             if ((status & 0x7f) == 0) {
-                posix.exit(@truncate((status >> 8) & 0xff));
+                std.process.exit(@truncate((status >> 8) & 0xff));
             }
-            posix.exit(1);
+            std.process.exit(1);
         } else {
             err("fork failed", .{});
-            posix.exit(1);
+            std.process.exit(1);
         }
     }
+
+    // PDEATHSIG is cleared for the child of fork; restore it so a timeout that
+    // kills the intermediate namespace process also kills sandbox PID 1.
+    setParentDeathSignal();
 
     // Now we're PID 1 in the new namespace
     log("entered namespaces (PID={})", .{linux.getpid()});
@@ -645,10 +681,10 @@ pub fn childMain(config: Config, orig_uid: u32, orig_gid: u32) noreturn {
     // Set up overlay filesystem
     // Use kernel overlayfs only if we have real root (not user namespace)
     const use_kernel_overlay = !using_user_ns;
-    switch (setupOverlay(config, use_kernel_overlay)) {
+    switch (setupOverlay(io, config, use_kernel_overlay)) {
         .err => |oe| {
             err("overlay setup failed: {}", .{oe});
-            posix.exit(1);
+            std.process.exit(1);
         },
         .ok => {},
     }
@@ -659,17 +695,17 @@ pub fn childMain(config: Config, orig_uid: u32, orig_gid: u32) noreturn {
     // Execute command
     const argv = allocator.allocSentinel(?[*:0]const u8, config.command.len, null) catch {
         err("out of memory", .{});
-        posix.exit(1);
+        std.process.exit(1);
     };
     for (config.command, 0..) |arg, i| {
         argv[i] = (allocator.dupeZ(u8, arg) catch {
             err("out of memory", .{});
-            posix.exit(1);
+            std.process.exit(1);
         }).ptr;
     }
 
     const envp = @as([*:null]const ?[*:0]const u8, @ptrCast(std.c.environ));
-    const exec_err = posix.execvpeZ(argv[0].?, argv, envp);
-    err("exec failed: {s}: {}", .{ config.command[0], exec_err });
-    posix.exit(127);
+    const exec_result = execvpe(argv[0].?, argv, envp);
+    err("exec failed: {s}: {d}", .{ config.command[0], exec_result });
+    std.process.exit(127);
 }

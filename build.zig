@@ -8,10 +8,9 @@ pub fn build(b: *std.Build) void {
     const version = b.option([]const u8, "version", "Version string") orelse "dev";
     const git_commit = b.option([]const u8, "git-commit", "Git commit hash") orelse blk: {
         // Try to get git commit at build time
-        const result = std.process.Child.run(.{
-            .allocator = b.allocator,
+        const result = std.process.run(b.allocator, b.graph.io, .{
             .argv = &.{ "git", "rev-parse", "--short", "HEAD" },
-            .cwd = b.build_root.path,
+            .cwd = .{ .path = b.build_root.path orelse "." },
         }) catch break :blk "";
         break :blk std.mem.trim(u8, result.stdout, "\n\r ");
     };

@@ -340,7 +340,7 @@ When you run `poof exec <command>`:
 
 ```
 1. Parent process
-   ├── Create temp directory /tmp/poof-<random>/
+   ├── Create temp directory /dev/shm/poof-<random>/
    ├── Set up cgroup (if resource limits specified)
    └── fork()
        │
@@ -351,13 +351,13 @@ When you run `poof exec <command>`:
           └── fork()  ← Required to enter new PID namespace
               │
               3. Second child (PID 1 in new namespace)
-                 ├── Mount tmpfs on /tmp/poof-<random>/
+                 ├── Mount tmpfs on /dev/shm/poof-<random>/
                  ├── Create upper/, work/, merged/ directories
                  ├── Mount overlay:
                  │     lowerdir=/
-                 │     upperdir=/tmp/poof-<random>/upper
-                 │     workdir=/tmp/poof-<random>/work
-                 │     merged=/tmp/poof-<random>/merged
+                 │     upperdir=/dev/shm/poof-<random>/upper
+                 │     workdir=/dev/shm/poof-<random>/work
+                 │     merged=/dev/shm/poof-<random>/merged
                  ├── Set up minimal /dev (bind mount null, zero, urandom, etc.)
                  ├── pivot_root(merged, merged/.oldroot)
                  ├── umount(/.oldroot, MNT_DETACH)
@@ -494,7 +494,7 @@ EXAMPLES
   $ poof run --upper=./changes bash   # Persist to ./changes/
 
 When the command exits, you'll see:
-  ● 3 changed files /tmp/poof-xxx
+  ● 3 changed files /dev/shm/poof-xxx
     + src/new-file.txt
     ~ src/modified.txt
     - src/deleted.txt
