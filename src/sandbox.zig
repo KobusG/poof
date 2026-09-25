@@ -120,14 +120,21 @@ pub fn writeFile(io: std.Io, path: []const u8, content: []const u8) !void {
 // User Namespace Setup
 // ============================================================================
 
-pub fn setupUidGidMappings(io: std.Io, uid: u32, gid: u32) !void {
+fn setupUidGidMappings(io: std.Io, inside_uid: u32, outside_uid: u32, inside_gid: u32, outside_gid: u32) !void {
     var buf: [64]u8 = undefined;
 
-    const uid_content = try std.fmt.bufPrint(&buf, "0 {d} 1\n", .{uid});
+    const uid_content = try std.fmt.bufPrint(&buf, "{d} {d} 1\n", .{ inside_uid, outside_uid });
     try writeFile(io, "/proc/self/uid_map", uid_content);
     try writeFile(io, "/proc/self/setgroups", "deny");
-    const gid_content = try std.fmt.bufPrint(&buf, "0 {d} 1\n", .{gid});
+    const gid_content = try std.fmt.bufPrint(&buf, "{d} {d} 1\n", .{ inside_gid, outside_gid });
     try writeFile(io, "/proc/self/gid_map", gid_content);
+}
+
+fn restoreUserIdentity(io: std.Io, uid: u32, gid: u32) !void {
+    const result = linux.unshare(linux.CLONE.NEWUSER);
+    const e = errnoFromSyscall(result);
+    if (e != .SUCCESS) return error.UserNamespaceFailed;
+    try setupUidGidMappings(io, uid, 0, gid, 0);
 }
 
 // ============================================================================
@@ -395,7 +402,7 @@ fn isInOverlayEnvironment(io: std.Io) bool {
 // Overlay Setup
 // ============================================================================
 
-pub fn setupOverlay(io: std.Io, config: Config, use_kernel_overlay: bool) Maybe(void) {
+pub fn setupOverlay(io: std.Io, config: Config, use_kernel_overlay: bool, orig_uid: u32, orig_gid: u32) Maybe(void) {
     const in_overlay = isInOverlayEnvironment(io);
     if (in_overlay) {
         log("detected overlay environment (Docker/container)", .{});
@@ -484,7 +491,7 @@ pub fn setupOverlay(io: std.Io, config: Config, use_kernel_overlay: bool) Maybe(
         }
         log("overlay mounted (kernel)", .{});
     } else {
-        // Use fuse-overlayfs for non-root (with squash_to_root)
+        // Use fuse-overlayfs for non-root (with squash_to_root).
         mountFuseOverlay(io, "/", upper_dir, work_dir, merged_dir) catch |e| {
             switch (e) {
                 error.FuseOverlayfsNotFound => {
@@ -566,6 +573,25 @@ pub fn setupOverlay(io: std.Io, config: Config, use_kernel_overlay: bool) Maybe(
             // Continue anyway - some things may still work
         };
 
+        const proc_path = std.fmt.allocPrint(allocator, "{s}/proc", .{merged_dir}) catch return .{ .err = .NOMEM };
+        const proc_z = allocator.dupeZ(u8, proc_path) catch return .{ .err = .NOMEM };
+        switch (mount("proc", proc_z.ptr, "proc", linux.MS.NOSUID | linux.MS.NODEV | linux.MS.NOEXEC, null)) {
+            .err => |e| log("failed to mount /proc: {}", .{e}),
+            .ok => {},
+        }
+
+        const tmp_path = std.fmt.allocPrint(allocator, "{s}/tmp", .{merged_dir}) catch return .{ .err = .NOMEM };
+        const tmp_z = allocator.dupeZ(u8, tmp_path) catch return .{ .err = .NOMEM };
+        switch (mount("tmpfs", tmp_z.ptr, "tmpfs", linux.MS.NOSUID | linux.MS.NODEV, null)) {
+            .err => |e| log("failed to mount /tmp: {}", .{e}),
+            .ok => {},
+        }
+
+        restoreUserIdentity(io, orig_uid, orig_gid) catch |e| {
+            err("failed to restore user identity: {}", .{e});
+            return .{ .err = .PERM };
+        };
+
         // Chroot into the merged directory
         const chroot_result = linux.chroot(merged_z.ptr);
         const chroot_err = errnoFromSyscall(chroot_result);
@@ -577,22 +603,6 @@ pub fn setupOverlay(io: std.Io, config: Config, use_kernel_overlay: bool) Maybe(
             _ = std.c.chdir("/");
         }
         log("chroot active", .{});
-
-        // Mount fresh /proc for PID namespace (not bind-mount - that would leak host processes)
-        switch (mount("proc", "/proc", "proc", linux.MS.NOSUID | linux.MS.NODEV | linux.MS.NOEXEC, null)) {
-            .err => |e| {
-                log("failed to mount /proc: {}", .{e});
-            },
-            .ok => {},
-        }
-
-        // Mount fresh /tmp inside chroot
-        switch (mount("tmpfs", "/tmp", "tmpfs", linux.MS.NOSUID | linux.MS.NODEV, null)) {
-            .err => |e| {
-                log("failed to mount /tmp: {}", .{e});
-            },
-            .ok => {},
-        }
 
         // Create symlinks for standard file descriptors (now that /proc is mounted)
         _ = std.c.symlinkat("/proc/self/fd", posix.AT.FDCWD, "/dev/fd");
@@ -647,7 +657,7 @@ pub fn childMain(io: std.Io, config: Config, orig_uid: u32, orig_gid: u32) noret
 
     // Set up uid/gid mappings for user namespace
     if (using_user_ns) {
-        setupUidGidMappings(io, orig_uid, orig_gid) catch |ue| {
+        setupUidGidMappings(io, 0, orig_uid, 0, orig_gid) catch |ue| {
             err("uid/gid mapping failed: {}", .{ue});
             std.process.exit(1);
         };
@@ -681,7 +691,7 @@ pub fn childMain(io: std.Io, config: Config, orig_uid: u32, orig_gid: u32) noret
     // Set up overlay filesystem
     // Use kernel overlayfs only if we have real root (not user namespace)
     const use_kernel_overlay = !using_user_ns;
-    switch (setupOverlay(io, config, use_kernel_overlay)) {
+    switch (setupOverlay(io, config, use_kernel_overlay, orig_uid, orig_gid)) {
         .err => |oe| {
             err("overlay setup failed: {}", .{oe});
             std.process.exit(1);

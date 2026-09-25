@@ -7,8 +7,7 @@ import { StringDecoder } from "node:string_decoder";
 const POOF_BIN = join(import.meta.dir, "../zig-out/bin/poof");
 // Use ephemeral tmpdir - must be outside /tmp since poof mounts fresh /tmp
 let TEST_DIR: string;
-// The sandbox enters a user namespace as mapped root, regardless of host UID.
-const SHELL_PROMPT = "# ";
+const SHELL_PROMPT = process.getuid?.() === 0 ? "# " : "$ ";
 
 describe("poof CLI", () => {
   beforeAll(() => {
@@ -214,6 +213,20 @@ describe("poof CLI", () => {
     });
 
     describe("environment", () => {
+      test("preserves the invoking uid and gid", () => {
+        const hostIdentity = `${process.getuid?.()} ${process.getgid?.()}`;
+        const result = spawnSync([POOF_BIN, "exec", "sh", "-c", "printf '%s %s' \"$(id -u)\" \"$(id -g)\""]);
+        expect(result.stdout.toString()).toBe(hostIdentity);
+        expect(result.exitCode).toBe(0);
+      });
+
+      test("preserves the invoking username", () => {
+        const hostUser = spawnSync(["id", "-un"]).stdout.toString().trim();
+        const result = spawnSync([POOF_BIN, "exec", "id", "-un"]);
+        expect(result.stdout.toString().trim()).toBe(hostUser);
+        expect(result.exitCode).toBe(0);
+      });
+
       test("sets IS_SANDBOX=1", () => {
         const result = spawnSync([POOF_BIN, "exec", "sh", "-c", "echo $IS_SANDBOX"]);
         expect(result.stdout.toString().trim()).toBe("1");
